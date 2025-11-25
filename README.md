@@ -174,7 +174,7 @@ To find a valid `QUAY_TAG`, look for successful builds in the StackRox CI/CD pip
 
 # Configure images later if skipped
 export QUAY_TAG=4.10.x-415-gd1af0f418d
-./set-operator-image-overrides.sh
+./setup-operator.sh --skip-build --skip-push
 ```
 
 ### 3. Run the Reproducer
@@ -268,7 +268,6 @@ The reproducer:
 ├── go.mod                           # Go module definition
 ├── Makefile                         # Build automation
 ├── setup-operator.sh                # Script to build and deploy operator
-├── set-operator-image-overrides.sh  # Script to configure operator images
 └── README.md                        # This file
 ```
 
@@ -287,10 +286,7 @@ The reproducer:
 * Pushes to configurable registry (handles local registries)
 * Installs CRDs and deploys operator
 * Updates deployment with custom-built image
-
-**`set-operator-image-overrides.sh`** - Image configuration:
-* Sets `RELATED_IMAGE_*` environment variables on operator deployment
-* Supports `QUAY_TAG` environment variable or auto-detection (if available)
+* Configures `RELATED_IMAGE_*` environment variables for Central components
 * Uses public `quay.io/stackrox-io` registry for Central components
 
 ## Configuration

@@ -294,7 +294,7 @@ if [ "$SKIP_IMAGE_CONFIG" = false ]; then
         echo ""
         echo "To configure Central component images later, run:"
         echo "  export QUAY_TAG=4.10.x-415-gd1af0f418d"
-        echo "  ./set-operator-image-overrides.sh"
+        echo "  ./setup-operator.sh --skip-build --skip-push"
         echo ""
     else
         echo "Configuring operator with Central images from quay.io/stackrox-io:$QUAY_TAG..."
@@ -355,7 +355,7 @@ if [ -n "$QUAY_TAG" ] && [ "$SKIP_IMAGE_CONFIG" = false ]; then
     echo "  Run reproducer: make run"
 else
     echo "Next steps:"
-    echo "  1. Configure Central images: export QUAY_TAG=<tag> && ./set-operator-image-overrides.sh"
+    echo "  1. Configure Central images: export QUAY_TAG=<tag> && ./setup-operator.sh --skip-build --skip-push"
     echo "  2. Run reproducer: make run"
 fi
 
