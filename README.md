@@ -29,27 +29,135 @@ Since the custom CA is only in the `additional-ca` secret (not mounted in config
 ## Prerequisites
 
 * Kubernetes cluster (tested with KinD)
-* cert-manager installed and running
-* StackRox operator installed and running
-* Go 1.22 or later (for building)
+* cert-manager installed
+* **StackRox source code cloned** from https://github.com/stackrox/stackrox
+* Go 1.22 or later
+* Podman or Docker
+* kubectl configured for your cluster
 
-## Quick Start
+**Important:** You need to have the StackRox repository checked out locally, as `setup-operator.sh` uses build scripts from the repository to build the operator binary.
+
+## Quick Start (TL;DR)
+
+```bash
+# 0. Clone StackRox repository (if not already done)
+git clone https://github.com/stackrox/stackrox
+cd stackrox
+
+# 1. Install cert-manager
+kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.16.2/cert-manager.yaml
+kubectl wait --for=condition=Available --timeout=300s deployment/cert-manager -n cert-manager
+
+# 2. Build, deploy operator, and configure images
+export QUAY_TAG=4.10.x-415-gd1af0f418d
+/path/to/config-controller-reproducer/setup-operator.sh --quay-tag "$QUAY_TAG"
+
+# For custom registry setup (e.g., KinD):
+# /path/to/config-controller-reproducer/setup-operator.sh \
+#   --push-registry localhost:5001 \
+#   --pull-registry kind-registry:5000 \
+#   --quay-tag "$QUAY_TAG"
+
+# 3. Run reproducer
+cd /path/to/config-controller-reproducer
+make run
+```
+
+## Complete Setup Guide
+
+This reproducer provides a turnkey setup that takes you from nothing to a fully working reproducer.
 
 ### 1. Install Prerequisites
 
 ```bash
-# Install cert-manager (if not already installed)
+# Install cert-manager
 kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.16.2/cert-manager.yaml
 
 # Wait for cert-manager to be ready
 kubectl wait --for=condition=Available --timeout=300s \
   deployment/cert-manager -n cert-manager
-
-# Install StackRox operator
-# (User should install operator according to StackRox documentation)
 ```
 
-### 2. Run the Reproducer
+### 2. Build, Deploy Operator, and Configure Images
+
+The setup script handles everything in one step. **Important:** Run the script from the StackRox repository root directory.
+
+```bash
+# Clone the StackRox repository if you haven't already
+git clone https://github.com/stackrox/stackrox
+cd stackrox
+
+# Set Central component tag
+export QUAY_TAG=4.10.x-415-gd1af0f418d      # Valid tag from master
+
+# Run the all-in-one setup script from the stackrox repo root
+/path/to/config-controller-reproducer/setup-operator.sh --quay-tag "$QUAY_TAG"
+```
+
+The script uses sensible defaults:
+* **Push Registry**: `localhost:5001` (for `podman push`)
+* **Pull Registry**: `kind-registry:5000` (for in-cluster pulls)
+* **Image Repo**: `stackrox/operator`
+
+**Custom Registry Setup:**
+
+For different environments, you can specify custom registries:
+
+```bash
+# KinD with local registry
+./setup-operator.sh \
+  --push-registry localhost:5001 \
+  --pull-registry kind-registry:5000 \
+  --quay-tag 4.10.x-415-gd1af0f418d
+
+# Same registry for both push and pull
+./setup-operator.sh \
+  --registry my-registry:5000 \
+  --quay-tag 4.10.x-415-gd1af0f418d
+
+# Custom image repository
+./setup-operator.sh \
+  --image-repo myorg/custom-operator \
+  --quay-tag 4.10.x-415-gd1af0f418d
+```
+
+By default, the script will look for the StackRox repository at the current directory or use `--worktree` to specify a different location.
+
+This single command will:
+1. **Build the operator binary** for your architecture using `scripts/go-build.sh`
+2. **Create a container image** with UBI9 minimal base
+3. **Push to your registry** (handles local registries with `--tls-verify=false`)
+4. **Install operator CRDs** via `make install`
+5. **Deploy the operator** via `make deploy`
+6. **Update deployment image** to use your built image
+7. **Configure Central images** with public `quay.io/stackrox-io` images
+8. **Wait for operator** to be ready
+
+For KinD clusters, the registry is typically `kind-registry:5000`. For other local setups, you might use `localhost:5001`.
+
+To find a valid `QUAY_TAG`, look for successful builds in the StackRox CI/CD pipeline from origin/master, or check recent tags in the public quay.io repository.
+
+**Advanced usage:**
+
+```bash
+# Use custom worktree location
+./setup-operator.sh --worktree /path/to/stackrox --registry kind-registry:5000 --quay-tag 4.10.x-415-gd1af0f418d
+
+# Skip build if binary already exists
+./setup-operator.sh --skip-build --quay-tag 4.10.x-415-gd1af0f418d
+
+# Skip push if image already in registry
+./setup-operator.sh --skip-push --quay-tag 4.10.x-415-gd1af0f418d
+
+# Skip image configuration (configure later manually)
+./setup-operator.sh --skip-image-config
+
+# Configure images later if skipped
+export QUAY_TAG=4.10.x-415-gd1af0f418d
+./set-operator-image-overrides.sh
+```
+
+### 3. Run the Reproducer
 
 ```bash
 # Build and run
@@ -116,20 +224,34 @@ The reproducer:
 
 ```
 .
-├── main.go           # Main reproducer logic
-├── go.mod            # Go module definition
-├── Makefile          # Build automation
-└── README.md         # This file
+├── main.go                          # Main reproducer logic (uses typed Central API)
+├── go.mod                           # Go module definition
+├── Makefile                         # Build automation
+├── setup-operator.sh                # Script to build and deploy operator
+├── set-operator-image-overrides.sh  # Script to configure operator images
+└── README.md                        # This file
 ```
 
 ## Code Overview
 
-The `main.go` file:
-
-* Uses the cert-manager Go API to create certificates dynamically
+**`main.go`** - Main reproducer:
+* Uses typed Central API from `github.com/stackrox/rox/operator/api/v1alpha1` for type safety
+* Uses cert-manager Go API to create certificates dynamically
 * Uses dynamic Kubernetes client to create Central CR
 * Implements proper wait logic for certificate readiness
 * Provides both reproduce and restore functionality
+
+**`setup-operator.sh`** - Operator deployment automation:
+* Builds operator binary for current architecture using `scripts/go-build.sh`
+* Creates minimal container image with UBI9 base
+* Pushes to configurable registry (handles local registries)
+* Installs CRDs and deploys operator
+* Updates deployment with custom-built image
+
+**`set-operator-image-overrides.sh`** - Image configuration:
+* Sets `RELATED_IMAGE_*` environment variables on operator deployment
+* Supports `QUAY_TAG` environment variable or auto-detection (if available)
+* Uses public `quay.io/stackrox-io` registry for Central components
 
 ## Configuration
 
