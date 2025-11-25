@@ -1,12 +1,12 @@
 # Config-Controller Crash Reproducer
 
-This is a self-contained reproducer for a bug in StackRox where `config-controller` crashes when Central is configured with custom TLS certificates via `additionalCAs`.
+This is a self-contained reproducer for a bug in StackRox where `config-controller` crashes when Central is configured with custom TLS certificates.
 
 ## Problem Description
 
 When a StackRox Central CR is configured with:
 1. Custom serving certificates (`spec.central.defaultTLSSecret`)
-2. The CA for those certificates in `spec.tls.additionalCAs`
+2. **The custom certificate includes internal service names in SANs** (e.g., `central.stackrox.svc`)
 
 The `config-controller` pod crashes with:
 ```
@@ -15,16 +15,36 @@ x509: certificate signed by unknown authority
 
 ### Root Cause
 
-The StackRox operator:
-- Creates an `additional-ca` secret from `spec.tls.additionalCAs`
-- Mounts this secret in the Central pod at `/usr/local/share/ca-certificates/`
-- **Does NOT mount** this secret in the config-controller pod
+The bug occurs due to Go's TLS certificate selection mechanism:
 
-Config-controller only trusts:
-- System CA bundle
-- `/run/secrets/stackrox.io/certs/ca.pem` (from `central-tls` secret)
+1. **Central serves BOTH certificates** by default:
+   - Custom certificate (from `defaultTLSSecret`)
+   - Operator certificate (from `central-tls`)
 
-Since the custom CA is only in the `additional-ca` secret (not mounted in config-controller), config-controller cannot verify Central's TLS certificate.
+2. **Go's TLS selects the FIRST certificate that matches SNI**:
+   - When config-controller connects to `central.stackrox.svc:443`
+   - If the custom cert includes `central.stackrox.svc` in SANs → **Custom cert selected**
+   - If the custom cert doesn't include internal SANs → **Operator cert selected (fallback)**
+
+3. **Config-controller cannot verify custom cert**:
+   - Only trusts: System CA bundle + `/run/secrets/stackrox.io/certs/ca.pem` (operator CA)
+   - Custom CA is NOT in either location
+   - Connection fails: `x509: certificate signed by unknown authority`
+
+### Why E2E Tests Don't Catch This
+
+E2E tests generate custom certificates with **external-only SANs** (e.g., `custom-tls-cert.central.stackrox.local`). When config-controller connects to `central.stackrox.svc`, the custom cert doesn't match, so Central serves the operator cert instead, and config-controller works fine.
+
+### Real-World Scenario
+
+Customers often include internal service names in their custom certificates (for internal traffic), which triggers the bug:
+```yaml
+spec:
+  central:
+    defaultTLSSecret:
+      name: openshift-rhacs-certificates
+# Certificate contains SANs: central.stackrox.svc, central.stackrox, etc.
+```
 
 ## Prerequisites
 
@@ -159,16 +179,25 @@ export QUAY_TAG=4.10.x-415-gd1af0f418d
 
 ### 3. Run the Reproducer
 
+**To trigger the bug** (include internal SANs in certificate):
 ```bash
-# Build and run
-make run
+# Build and run with internal SANs
+make build
+./bin/reproducer -include-internal-sans
 
-# Or manually
-go build -o bin/reproducer .
+# Or using make
+# (Note: make run doesn't pass flags, so use the binary directly)
+```
+
+**To verify it doesn't happen without internal SANs**:
+```bash
+# Run without internal SANs (should work fine)
+make run
+# Or
 ./bin/reproducer
 ```
 
-### 3. Observe the Crash
+### 4. Observe the Crash
 
 ```bash
 # Watch config-controller pods
@@ -186,7 +215,7 @@ desc = "transport: authentication handshake failed:
 x509: certificate signed by unknown authority"
 ```
 
-### 4. Restore Environment
+### 5. Restore Environment
 
 ```bash
 # Delete the Central CR (operator will clean up)
@@ -201,7 +230,11 @@ make restore
 The reproducer:
 
 1. **Creates a custom CA** using cert-manager `ClusterIssuer` with self-signed certificates
+
 2. **Generates Central TLS certificates** signed by the custom CA
+   - **With `-include-internal-sans`**: Certificate includes `central.stackrox.svc` in SANs
+   - **Without flag**: Certificate uses only external SANs (`central-external.example.com`)
+
 3. **Creates a Central CR** with:
    ```yaml
    spec:
@@ -213,12 +246,19 @@ The reproducer:
          - name: custom-ca.crt
            content: <CA certificate PEM>
    ```
+
 4. **Operator processes the CR** and:
-   - Creates `additional-ca` secret from `spec.tls.additionalCAs`
-   - Deploys Central with custom serving cert
-   - Deploys Central with `additional-ca` volume mounted
-   - Deploys config-controller **without** `additional-ca` volume mounted ❌
-5. **Config-controller crashes** because it cannot verify Central's certificate
+   - Deploys Central with both custom cert and operator cert configured
+   - Mounts `additional-ca` in Central pod (for trusting external services)
+   - Does **not** mount `additional-ca` in config-controller pod
+
+5. **Certificate selection happens**:
+   - **With internal SANs**: Config-controller connects to `central.stackrox.svc:443`
+     - Central's TLS library checks custom cert SANs → Match! → Serves custom cert
+     - Config-controller cannot verify custom cert → Crash
+   - **Without internal SANs**: Config-controller connects to `central.stackrox.svc:443`
+     - Central's TLS library checks custom cert SANs → No match
+     - Falls back to operator cert → Config-controller verifies it → Works
 
 ## Project Structure
 
@@ -268,10 +308,26 @@ const (
 
 ## Advanced Usage
 
+### Trigger the Bug (Include Internal SANs)
+
+```bash
+./bin/reproducer -include-internal-sans
+```
+
+This creates a certificate with internal service names in SANs, causing Central to serve the custom cert, which config-controller cannot verify.
+
+### Use External SANs Only (Bug Not Triggered)
+
+```bash
+./bin/reproducer
+```
+
+This creates a certificate with only external SANs. Central falls back to the operator cert for internal connections, so config-controller works.
+
 ### Use Custom Kubeconfig
 
 ```bash
-./bin/reproducer -kubeconfig ~/.kube/my-cluster-config
+./bin/reproducer -kubeconfig ~/.kube/my-cluster-config -include-internal-sans
 ```
 
 ### Restore Environment
@@ -311,30 +367,44 @@ After running the reproducer:
    kubectl logs -n stackrox -l app=config-controller | grep "x509"
    ```
 
-## Expected Fix
+## The Fix
 
-The fix would involve updating the operator to mount `additional-ca-volume` in config-controller:
+The fix adds the custom CA from `defaultTLSSecret` to config-controller's system trust store using an init container:
 
 ```yaml
 # In config-controller deployment template
-volumeMounts:
-- name: additional-ca-volume
-  mountPath: /usr/local/share/ca-certificates/
-  readOnly: true
+initContainers:
+- name: init-ca-trust
+  image: <central-image>
+  command:
+  - /bin/sh
+  - -c
+  - |
+    if [ -f /default-tls-cert/tls.crt ]; then
+      cp /default-tls-cert/tls.crt /etc/pki/ca-trust/source/anchors/default-tls-ca.crt
+      update-ca-trust extract
+    fi
+  volumeMounts:
+  - name: default-tls-cert-volume
+    mountPath: /default-tls-cert
+    readOnly: true
+  - name: etc-pki-volume
+    mountPath: /etc/pki/ca-trust
+
+containers:
+- name: manager
+  volumeMounts:
+  - name: etc-pki-volume
+    mountPath: /etc/pki/ca-trust
+    readOnly: true
 
 volumes:
-- name: additional-ca-volume
+- name: default-tls-cert-volume
   secret:
-    secretName: additional-ca
+    secretName: <defaultTLSSecret-name>
     optional: true
+- name: etc-pki-volume
+  emptyDir: {}
 ```
 
-## License
-
-This reproducer is provided as-is for debugging purposes.
-
-## Related Issues
-
-* Customer ticket: RHACS using custom CA + backup/restore
-* Component: config-controller
-* Error: `x509: certificate signed by unknown authority`
+This ensures config-controller can verify Central's custom certificate regardless of which cert Central serves.

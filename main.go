@@ -19,7 +19,6 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/utils/pointer"
 )
 
 const (
@@ -33,8 +32,9 @@ const (
 )
 
 var (
-	kubeconfig string
-	restore    bool
+	kubeconfig        string
+	restore           bool
+	includeInternalSANs bool
 )
 
 func init() {
@@ -42,6 +42,7 @@ func init() {
 	defaultKubeconfig := os.Getenv("KUBECONFIG")
 	flag.StringVar(&kubeconfig, "kubeconfig", defaultKubeconfig, "Path to kubeconfig file (defaults to KUBECONFIG env var)")
 	flag.BoolVar(&restore, "restore", false, "Restore by deleting the Central CR")
+	flag.BoolVar(&includeInternalSANs, "include-internal-sans", false, "Include internal service names (central.stackrox.svc) in certificate SANs (triggers the bug)")
 }
 
 func main() {
@@ -111,13 +112,26 @@ func doReproduce(ctx context.Context, clientset *kubernetes.Clientset, dynamicCl
 	log("This reproducer will:")
 	log("1. Create a custom CA using cert-manager")
 	log("2. Generate Central serving certificates from that CA")
+	if includeInternalSANs {
+		log("   - Certificate will include internal SANs: central.stackrox.svc, etc.")
+		log("   - This triggers the bug: Central selects custom cert, config-controller can't verify it")
+	} else {
+		log("   - Certificate will use external-only SANs")
+		log("   - This may NOT trigger the bug: Central falls back to operator cert")
+	}
 	log("3. Create a Central CR with:")
 	log("   - Custom serving cert (spec.central.defaultTLSSecret)")
 	log("   - Custom CA in additionalCAs (spec.tls.additionalCAs)")
-	log("4. Config-controller should crash because:")
-	log("   - Central serves with custom cert")
-	log("   - Custom CA is in additional-ca secret")
-	log("   - Config-controller does NOT mount additional-ca secret")
+	log("4. Expected behavior:")
+	if includeInternalSANs {
+		log("   - Central serves custom cert (matches SNI: central.stackrox.svc)")
+		log("   - Config-controller cannot verify it (doesn't trust custom CA)")
+		log("   - Config-controller crashes with: x509: certificate signed by unknown authority")
+	} else {
+		log("   - Central serves operator cert (custom cert doesn't match SNI)")
+		log("   - Config-controller can verify it (trusts operator CA)")
+		log("   - Config-controller works (bug not triggered)")
+	}
 	log("")
 
 	// Step 1: Ensure namespace exists
@@ -154,20 +168,41 @@ func doReproduce(ctx context.Context, clientset *kubernetes.Clientset, dynamicCl
 	log("")
 	log("The Central CR has been created with:")
 	log("  - Custom serving cert: %s", centralSecretName)
+	if includeInternalSANs {
+		log("  - Certificate includes internal SANs (central.%s.svc, etc.)", namespace)
+	} else {
+		log("  - Certificate uses external-only SANs (central-external.example.com)")
+	}
 	log("  - Additional CA configured in spec.tls.additionalCAs")
 	log("")
 	log("Expected behavior:")
 	log("  - Operator will create additional-ca secret from spec.tls.additionalCAs")
 	log("  - Operator will mount additional-ca in Central pod")
 	log("  - Operator will NOT mount additional-ca in config-controller pod")
-	log("  - Config-controller will crash with: x509: certificate signed by unknown authority")
+	if includeInternalSANs {
+		log("  - Config-controller connects to central.%s.svc:443", namespace)
+		log("  - Central serves custom cert (SNI matches)")
+		log("  - Config-controller crashes with: x509: certificate signed by unknown authority")
+	} else {
+		log("  - Config-controller connects to central.%s.svc:443", namespace)
+		log("  - Central serves operator cert (custom cert SNI doesn't match)")
+		log("  - Config-controller works normally (bug not triggered)")
+	}
 	log("")
 	log("Monitor with:")
+	log("  kubectl get pods -n %s -w", namespace)
 	log("  kubectl get pods -n %s -l app=config-controller", namespace)
 	log("  kubectl logs -n %s -l app=config-controller --tail=50", namespace)
 	log("")
+	log("Check certificate details:")
+	log("  kubectl get certificate -n %s %s -o yaml", namespace, centralCertName)
+	log("  kubectl get secret -n %s %s -o jsonpath='{.data.tls\\.crt}' | base64 -d | openssl x509 -text -noout | grep -A2 'Subject Alternative Name'", namespace, centralSecretName)
+	log("")
 	log("To restore:")
 	log("  %s -restore", os.Args[0])
+	log("")
+	log("To trigger the bug:")
+	log("  %s -include-internal-sans", os.Args[0])
 
 	return nil
 }
@@ -326,6 +361,33 @@ func createCentralCertificate(ctx context.Context, dynamicClient dynamic.Interfa
 		return errors.Wrap(err, "failed to create CA issuer")
 	}
 
+	// Configure certificate SANs based on flag
+	var dnsNames []interface{}
+	var commonName string
+
+	if includeInternalSANs {
+		// Include internal service names - this triggers the bug!
+		// When config-controller connects to central.stackrox.svc:443,
+		// Central will serve this custom cert (because SNI matches),
+		// and config-controller won't be able to verify it.
+		commonName = fmt.Sprintf("central.%s.svc", namespace)
+		dnsNames = []interface{}{
+			"central",
+			fmt.Sprintf("central.%s", namespace),
+			fmt.Sprintf("central.%s.svc", namespace),
+			fmt.Sprintf("central.%s.svc.cluster.local", namespace),
+		}
+	} else {
+		// Only external names - Central will fallback to operator cert for internal connections
+		// Config-controller connects to central.stackrox.svc, which doesn't match these SANs,
+		// so Central serves the operator cert instead, and config-controller works.
+		commonName = "central-external.example.com"
+		dnsNames = []interface{}{
+			"central-external.example.com",
+			"*.central-external.example.com",
+		}
+	}
+
 	cert := &unstructured.Unstructured{
 		Object: map[string]interface{}{
 			"apiVersion": "cert-manager.io/v1",
@@ -337,13 +399,8 @@ func createCentralCertificate(ctx context.Context, dynamicClient dynamic.Interfa
 			"spec": map[string]interface{}{
 				"secretName": centralSecretName,
 				"duration":   "87600h",
-				"commonName": fmt.Sprintf("central.%s.svc", namespace),
-				"dnsNames": []interface{}{
-					"central",
-					fmt.Sprintf("central.%s", namespace),
-					fmt.Sprintf("central.%s.svc", namespace),
-					fmt.Sprintf("central.%s.svc.cluster.local", namespace),
-				},
+				"commonName": commonName,
+				"dnsNames":   dnsNames,
 				"privateKey": map[string]interface{}{
 					"algorithm": "RSA",
 					"size":      2048,
