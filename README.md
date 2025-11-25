@@ -1,4 +1,4 @@
-# Config-Controller Crash Reproducer
+# [ROX-30781](https://issues.redhat.com/browse/ROX-30781): Config-Controller Crash Reproducer
 
 This is a self-contained reproducer for a bug in StackRox where `config-controller` crashes when Central is configured with custom TLS certificates.
 
